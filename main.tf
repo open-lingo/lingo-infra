@@ -174,6 +174,49 @@ resource "aws_dynamodb_table" "decks" {
   }
 }
 
+# ── Progress (per-attempt log + lesson/day/concept rollups) ───────────────────
+# See lingo-core/docs/adr/0001-progress-api-hybrid-rollup.md for the design.
+# Single-table per user (PK = USER#<id>), four SK shapes:
+#   ATTEMPT#<lessonId>#<isoTs>  — immutable per-attempt log
+#   LESSON#<lessonId>           — eager best-score rollup
+#   DAY#<YYYY-MM-DD>            — eager daily activity rollup
+#   CONCEPT#<conceptId>         — lazy-materialized mastery rollup
+#
+# user_id + attemptedAt power the UserAttempts-Index GSI (sparse — only ATTEMPT
+# rows write to it). Used for recent-attempts feeds and lazy concept recompute.
+# Streak / XP / lingots live on the existing users table, not here.
+
+resource "aws_dynamodb_table" "progress" {
+  name         = "${var.table_prefix}progress"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+  attribute {
+    name = "attemptedAt"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "UserAttempts-Index"
+    hash_key        = "user_id"
+    range_key       = "attemptedAt"
+    projection_type = "ALL"
+  }
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 
 output "users_table_name" {
@@ -190,4 +233,8 @@ output "srs_table_name" {
 
 output "decks_table_name" {
   value = aws_dynamodb_table.decks.name
+}
+
+output "progress_table_name" {
+  value = aws_dynamodb_table.progress.name
 }
