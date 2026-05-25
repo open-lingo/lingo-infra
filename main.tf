@@ -22,8 +22,25 @@ variable "aws_region" {
   default     = "us-west-1"
 }
 
+variable "environment" {
+  description = "Deployment environment (dev / staging / prod) — surfaced as a tag on newly-provisioned tables."
+  type        = string
+  default     = "dev"
+}
+
 provider "aws" {
   region = var.aws_region
+}
+
+# Standard tag set for new tables. Applied below on lingo_social,
+# lingo_social_leaderboard, and lingo_deck_votes. Older tables predate this
+# convention and aren't retagged here to avoid an in-place "update" diff that
+# isn't related to the new feature work.
+locals {
+  common_tags = {
+    Project     = "open-lingo"
+    Environment = var.environment
+  }
 }
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -217,6 +234,198 @@ resource "aws_dynamodb_table" "progress" {
   }
 }
 
+# ── Social (friends, requests, blocks, activity, invites, threads) ────────────
+#
+# Mirrors the single-table layout documented in lingo-core
+# app/db/dynamo/social.py — that file is the source of truth for the key
+# shapes below. The DynamoSocialRepository methods write/read these exact
+# patterns; **do not change PK/SK conventions here without updating that
+# module first**.
+#
+# Status: the Dynamo repo is wired but the production handler currently
+# falls back to the SQLite-first impl. Provisioning this ahead of the cut-
+# over so the table is ready when the switch flips. — 2026-05-25
+#
+# Key layout:
+#   PK = USER#<id>             SK = FRIEND#<friend_id>
+#   PK = USER#<id>             SK = REQUEST_IN#<from_id>
+#   PK = USER#<id>             SK = REQUEST_OUT#<to_id>
+#   PK = USER#<id>             SK = BLOCK#<blocked_id>
+#   PK = USER#<id>             SK = ACTIVITY#<created_at>#<activity_id>
+#   PK = USER#<id>             SK = THREAD#<thread_id>
+#   PK = ACTIVITY#<id>         SK = META
+#   PK = ACTIVITY#<id>         SK = REACTION#<id>#<kind>#<user_id>
+#   PK = INVITE#<code>         SK = META
+#   PK = INVITE#<code>         SK = REDEMPTION#<invitee_id>
+#   PK = INVITE_OWNER#<owner>  SK = META
+#   PK = INVITER#<owner>       SK = REDEMPTION#<year_month>#<invitee_id>
+#   PK = THREAD#<id>           SK = META
+#   PK = THREAD#<id>           SK = MESSAGE#<sent_at>#<message_id>
+#
+# Access patterns + decision log:
+#   1. list_friends(user)               → Query PK=USER#u, SK begins_with FRIEND#
+#   2. list_friend_requests(user)       → 2x Query PK=USER#u, REQUEST_IN# / REQUEST_OUT#
+#   3. is_friend / get_request / is_blocked / get_block → GetItem on exact (PK,SK)
+#   4. add_friend_edge                   → 2x PutItem (reciprocal — both users get a row)
+#   5. list_activity(user, friends)      → fan-out Query per uid, SK begins_with ACTIVITY#
+#   6. get_activity / list_reactions     → GetItem / Query under PK=ACTIVITY#id
+#   7. invite by code                    → GetItem PK=INVITE#code, SK=META
+#   8. invite by owner                   → GetItem PK=INVITE_OWNER#owner, SK=META
+#   9. monthly redemption cap            → Query PK=INVITER#owner, SK begins_with REDEMPTION#YYYY-MM#
+#  10. list_threads_for_user             → Query PK=USER#u, SK begins_with THREAD#
+#  11. list_messages(thread)             → Query PK=THREAD#id, SK begins_with MESSAGE#
+#
+# GSIs: NONE.
+#   The repo intentionally writes reciprocal rows (friend edges go to both
+#   users; invite redemptions get mirrored to INVITER#<owner> so the monthly
+#   cap query is bounded). Every read path resolves to a (PK, SK) Query or
+#   GetItem. There is no "who's blocked me?" route in the protocol — adding
+#   an inverse-BLOCK GSI now would burn WCU on every block write for no read.
+#
+# TTL: NONE for now. Activity items + DM messages have no expiry in the
+#   protocol today and routers may scroll back arbitrarily far.
+
+resource "aws_dynamodb_table" "social" {
+  name         = "${var.table_prefix}social"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = local.common_tags
+}
+
+# ── Social leaderboard (per-bucket XP ranking) ────────────────────────────────
+#
+# Kept SEPARATE from lingo_social on purpose:
+#   - Write rate is much higher (every lesson batch that earns XP from every
+#     opted-in user fires one UpdateItem here, partitioned by language+period).
+#     Co-tenanting with lingo_social spreads heat across one partition space
+#     and complicates eventual TTL/migration of one without the other.
+#   - The data is ephemeral (TTL after period close) — lingo_social rows are
+#     long-lived.
+#
+# Bucket scheme (matches scripts/seed.py + app/progress/router.py):
+#   weekly:  "{lang_id}#{YYYY}-W{ww}"          e.g. "ja#2026-W21"
+#   monthly: "{lang_id}#{YYYY}-{MM}"           e.g. "ja#2026-05"
+#
+# Key layout:
+#   PK = BUCKET#<bucket_str>     SK = USER#<user_id>
+#
+# Access patterns + decision log:
+#   1. add_xp_to_leaderboard(user, lang, xp)
+#       → UpdateItem PK=BUCKET#x, SK=USER#me, ADD xp :inc, SET ttl=<epoch>
+#       (wired in app/progress/router.py; Dynamo impl pending)
+#   2. get my row for a bucket → GetItem (PK, SK)
+#   3. top-N for a bucket      → NOT YET WIRED. Current /social/leaderboards/*
+#      endpoints compute rankings on-the-fly from progress rollups; they
+#      don't read this table. When the read switches to query this table,
+#      add a GSI:
+#          GSI1PK = "PK" (i.e. BUCKET#x)   GSI1SK = "xp" (N)
+#      and Query ScanIndexForward=false for top-N. Skipping it now avoids
+#      paying WCU amplification on every leaderboard write for a read path
+#      no code exercises. **Add the GSI in the same commit that switches
+#      the read path** — not earlier.
+#
+# TTL: enabled on attribute "ttl" (epoch seconds). Producer (Python) is
+#   expected to set ttl = bucket_end + 30 days grace so historical buckets
+#   self-purge per [[project-social-design]] (30-day retention on inactivity).
+#   Empty/null ttl rows are NOT auto-deleted — only rows with a numeric ttl
+#   in the past get reaped. Backfill writes that omit ttl persist forever,
+#   which is the safe default.
+
+resource "aws_dynamodb_table" "social_leaderboard" {
+  name         = "${var.table_prefix}social_leaderboard"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = local.common_tags
+}
+
+# ── Deck votes (per-user upvotes on community decks) ──────────────────────────
+#
+# Kept SEPARATE from lingo_decks on purpose:
+#   - lingo_decks has two GSIs (StatusLanguage-Index, AuthorUpdated-Index)
+#     that vote rows would have to pay WCU into on every vote write, for
+#     zero read benefit (no listing route filters/sorts by vote).
+#   - Deck content items are large (cards JSON serialised inline); vote
+#     rows are tiny. Mixing item sizes in one partition muddies hot-key
+#     diagnostics.
+#   - Deletes of a deck need to cascade through votes; doing that in a
+#     dedicated table is a straightforward Query+BatchWriteItem loop.
+#
+# **Status: NOT YET IMPLEMENTED in app/db/dynamo/deck.py.** The vote
+# methods there raise NotImplementedError per maintainer instruction
+# (SQLite-first; Dynamo lands after the SQLite path validates). This
+# Terraform exists so the table is provisioned before that cut-over so the
+# implementer doesn't get blocked on infra.
+#
+# Mirrors the SQLite shape in app/db/sqlite/deck.py (deck_votes:
+# PRIMARY KEY (deck_id, user_id), index on (deck_id)).
+#
+# Key layout:
+#   PK = DECK#<deck_id>     SK = USER#<user_id>
+#   attrs: deck_id, user_id, created_at
+#
+# Access patterns + decision log:
+#   1. add_vote(deck, user)    → PutItem (idempotent — same key overwrites)
+#   2. remove_vote(deck, user) → DeleteItem
+#   3. get_vote_state(deck, user)
+#       → GetItem (PK, SK) for "voted?", plus get_vote_count for "count"
+#   4. get_vote_count(deck)    → Query PK=DECK#d, Select=COUNT
+#   5. get_vote_counts([decks]) → N parallel queries (page-sized N, fine
+#      on-demand). If this becomes hot, materialize a counter on the deck
+#      item itself in lingo_decks via UpdateItem ADD voteCount :1 — but
+#      don't pre-build that until /decks list responses start dominating
+#      vote-count cost.
+#
+# GSIs: NONE.
+#   No route lists "decks user X voted on" — adding a USER#u → DECK#d
+#   inverse GSI would burn WCU per vote for an unused read.
+#
+# TTL: NONE. Votes are persistent.
+
+resource "aws_dynamodb_table" "deck_votes" {
+  name         = "${var.table_prefix}deck_votes"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = local.common_tags
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 
 output "users_table_name" {
@@ -237,4 +446,16 @@ output "decks_table_name" {
 
 output "progress_table_name" {
   value = aws_dynamodb_table.progress.name
+}
+
+output "social_table_name" {
+  value = aws_dynamodb_table.social.name
+}
+
+output "social_leaderboard_table_name" {
+  value = aws_dynamodb_table.social_leaderboard.name
+}
+
+output "deck_votes_table_name" {
+  value = aws_dynamodb_table.deck_votes.name
 }
