@@ -677,7 +677,7 @@ resource "aws_lambda_function_url" "lingo_ops" {
     # domain is in place. Adding multiple origins is fine; wildcards
     # would defeat the point of the CORS layer.
     allow_origins  = ["https://CHANGE-ME-prod-lingo-domain"]
-    allow_methods  = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_methods  = ["GET", "POST", "PUT", "DELETE"]
     allow_headers  = ["authorization", "content-type", "x-dev-user"]
     expose_headers = ["content-type"]
     max_age        = 3600
