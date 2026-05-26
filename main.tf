@@ -538,8 +538,9 @@ resource "aws_dynamodb_table" "jobs" {
 # already targets manylinux2014_aarch64.
 
 variable "lingo_ops_zip_path" {
-  description = "Path to the lingo-ops Lambda zip built by scripts/build-zip.sh — pass via -var or .tfvars (no default; absent path is a hard error so we don't silently apply a stale zip)."
+  description = "Path to the lingo-ops Lambda zip built by scripts/build-zip.sh. Defaults to the sibling repo's dist output; override with -var or .tfvars if the layout differs."
   type        = string
+  default     = "../lingo-ops/dist/lingo-ops.zip"
 }
 
 # Trust policy: only Lambda can assume this role.
