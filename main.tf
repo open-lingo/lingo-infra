@@ -731,3 +731,59 @@ output "lingo_ops_url" {
   description = "Public HTTPS endpoint for the lingo-ops Lambda. Wire into lingo as VITE_OPS_API_BASE_URL."
   value       = aws_lambda_function_url.lingo_ops.function_url
 }
+
+# ── Deploy IAM user (CI / terraform apply from GitHub Actions) ────────────
+# Why a dedicated user: CI needs long-lived programmatic credentials that
+# can be rotated independently of the maintainer's personal access. The
+# user gets AdministratorAccess because Terraform here creates IAM, Lambda,
+# Dynamo, Secrets Manager — narrowing further would be a per-action
+# allow-list that's a bigger maintenance burden than the side-project
+# scale justifies.
+#
+# Tripwire: when this project grows past a small team OR when CI starts
+# running anything beyond `terraform plan`/`apply`, migrate to GitHub
+# OIDC + a short-lived AssumeRole instead of long-lived keys. See
+# docs/dev/aws-environments.md (lingo monorepo) for the migration target.
+
+resource "aws_iam_user" "deploy" {
+  name = "lingo-deploy"
+  tags = merge(local.common_tags, { Domain = "ops" })
+}
+
+resource "aws_iam_user_policy_attachment" "deploy_admin" {
+  user       = aws_iam_user.deploy.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+resource "aws_iam_access_key" "deploy" {
+  user = aws_iam_user.deploy.name
+}
+
+# Stash the credentials in Secrets Manager so the maintainer can retrieve
+# them after apply without having to capture terraform output. Costs $0.40
+# per secret per month — negligible.
+resource "aws_secretsmanager_secret" "deploy_credentials" {
+  name        = "lingo/deploy-iam-credentials"
+  description = "Access keys for the lingo-deploy IAM user. Paste into GitHub org secrets."
+  tags        = merge(local.common_tags, { Domain = "ops" })
+}
+
+resource "aws_secretsmanager_secret_version" "deploy_credentials" {
+  secret_id = aws_secretsmanager_secret.deploy_credentials.id
+  secret_string = jsonencode({
+    aws_access_key_id     = aws_iam_access_key.deploy.id
+    aws_secret_access_key = aws_iam_access_key.deploy.secret
+  })
+}
+
+output "deploy_user_arn" {
+  value = aws_iam_user.deploy.arn
+}
+
+# Retrieve the live credentials with:
+#   aws secretsmanager get-secret-value \
+#     --secret-id lingo/deploy-iam-credentials \
+#     --query SecretString --output text | jq .
+output "deploy_credentials_secret_arn" {
+  value = aws_secretsmanager_secret.deploy_credentials.arn
+}
