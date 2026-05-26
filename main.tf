@@ -645,7 +645,7 @@ resource "aws_lambda_function" "lingo_ops" {
       AUTH0_AUDIENCE                    = ""
       ADMIN_USER_IDS                    = "[]"
       OPS_JOB_TOKEN                     = "changeme"
-      CORS_ORIGINS                      = "[\"https://CHANGE-ME-prod-lingo-domain\"]"
+      CORS_ORIGINS                      = "[\"https://openlingoapp.com\", \"https://www.openlingoapp.com\"]"
       STRIPE_API_KEY                    = ""
       STRIPE_WEBHOOK_SECRET             = ""
       GOOGLE_ADSENSE_ACCOUNT            = ""
@@ -676,7 +676,7 @@ resource "aws_lambda_function_url" "lingo_ops" {
     # Locked to the production lingo origin — update when the real
     # domain is in place. Adding multiple origins is fine; wildcards
     # would defeat the point of the CORS layer.
-    allow_origins  = ["https://CHANGE-ME-prod-lingo-domain"]
+    allow_origins  = ["https://openlingoapp.com", "https://www.openlingoapp.com"]
     allow_methods  = ["GET", "POST", "PUT", "DELETE"]
     allow_headers  = ["authorization", "content-type", "x-dev-user"]
     expose_headers = ["content-type"]
