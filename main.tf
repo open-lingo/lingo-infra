@@ -32,10 +32,14 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Standard tag set for new tables. Applied below on lingo_social,
-# lingo_social_leaderboard, and lingo_deck_votes. Older tables predate this
-# convention and aren't retagged here to avoid an in-place "update" diff that
-# isn't related to the new feature work.
+# Standard tag set applied to every table. The `Domain` tag is per-table
+# (merged in via `merge(local.common_tags, { Domain = "<domain>" })` on
+# each resource) so AWS Cost Explorer can break spend down by domain —
+# powers /api/ops/v1/finance/costs/by-domain in lingo-ops.
+#
+# Cost allocation tags become queryable only after a one-time activation
+# in the AWS Billing console (Cost allocation tags → Activate `Project`,
+# `Environment`, `Domain`), with ~24h propagation. See docs/cost-tags.md.
 locals {
   common_tags = {
     Project     = "open-lingo"
@@ -90,6 +94,8 @@ resource "aws_dynamodb_table" "users" {
     range_key       = "GSI2SK"
     projection_type = "ALL"
   }
+
+  tags = merge(local.common_tags, { Domain = "users" })
 }
 
 # ── Subscriptions (user content subscriptions: decks, addons, stories) ─────────
@@ -108,6 +114,12 @@ resource "aws_dynamodb_table" "subscriptions" {
     name = "SK"
     type = "S"
   }
+
+  # Subscriptions belong to the user domain (each row is owned by a user
+  # and the only access pattern is user-scoped). Bucketing under "users"
+  # keeps the Cost Explorer rollup matching the bill-mental-model rather
+  # than the storage-layout-mental-model.
+  tags = merge(local.common_tags, { Domain = "users" })
 }
 
 # ── SRS (per-user card state) ─────────────────────────────────────────────────
@@ -141,6 +153,8 @@ resource "aws_dynamodb_table" "srs" {
     range_key       = "dueDate"
     projection_type = "ALL"
   }
+
+  tags = merge(local.common_tags, { Domain = "srs" })
 }
 
 # ── Decks ─────────────────────────────────────────────────────────────────────
@@ -189,6 +203,8 @@ resource "aws_dynamodb_table" "decks" {
     range_key       = "authorUpdatedDeck"
     projection_type = "ALL"
   }
+
+  tags = merge(local.common_tags, { Domain = "decks" })
 }
 
 # ── Progress (per-attempt log + lesson/day/concept rollups) ───────────────────
@@ -232,6 +248,8 @@ resource "aws_dynamodb_table" "progress" {
     range_key       = "attemptedAt"
     projection_type = "ALL"
   }
+
+  tags = merge(local.common_tags, { Domain = "progress" })
 }
 
 # ── Social (friends, requests, blocks, activity, invites, threads) ────────────
@@ -300,7 +318,7 @@ resource "aws_dynamodb_table" "social" {
     type = "S"
   }
 
-  tags = local.common_tags
+  tags = merge(local.common_tags, { Domain = "social" })
 }
 
 # ── Social leaderboard (per-bucket XP ranking) ────────────────────────────────
@@ -362,7 +380,7 @@ resource "aws_dynamodb_table" "social_leaderboard" {
     enabled        = true
   }
 
-  tags = local.common_tags
+  tags = merge(local.common_tags, { Domain = "social" })
 }
 
 # ── Deck votes (per-user upvotes on community decks) ──────────────────────────
@@ -423,7 +441,246 @@ resource "aws_dynamodb_table" "deck_votes" {
     type = "S"
   }
 
-  tags = local.common_tags
+  tags = merge(local.common_tags, { Domain = "decks" })
+}
+
+# ── Jobs (lingo-ops batch-job telemetry log) ──────────────────────────────────
+#
+# Append-only history of batch-job runs (nightly aggregation, TTS regen,
+# deck-approval sweeps, …). The lingo-ops admin dashboard reads it; the
+# batch scripts themselves write via POST /api/ops/v1/jobs/log.
+#
+# Key layout (mirrors app/db/dynamo/jobs.py):
+#   PK = "JOB#<job_name>"       SK = "RUN#<started_at_iso>#<id>"
+#   GSI1PK = "ALL"              GSI1SK = "<started_at_iso>#<id>"
+#
+# Access patterns + decision log:
+#   1. log(job)            → PutItem
+#   2. recent(job_name=X)  → Query PK=JOB#X, ScanIndexForward=False
+#   3. recent() (all)      → Query AllRecent-Index, GSI1PK="ALL", desc
+#   4. last_24h_counts()   → Query AllRecent-Index with GSI1SK >= 24h-ago
+#   5. by_job_summary()    → Scan AllRecent-Index, group in Lambda
+#   6. delete_older_than() → Query AllRecent-Index with GSI1SK < cutoff,
+#                            BatchWriteItem(delete) by (PK, SK)
+#
+# Why single-partition GSI is fine:
+#   ~10-100 runs/day max. Dynamo's per-partition hot-write threshold
+#   kicks in around ~1000 writes/sec. When traffic grows we'd shard
+#   GSI1PK = "ALL#<day>" — same read code (issue N queries).
+#
+# Why NO GSI on status:
+#   4 status values, "recent failed" is the only realistic filter, and
+#   over-fetching the most recent 500 from the GSI is cheaper than the
+#   WCU amplification of a per-status sparse GSI at our volume.
+#
+# TTL: enabled on "ttl" (epoch seconds, set by the app to
+# started_at + 90d). Auto-purges old rows so the DELETE /jobs/old admin
+# endpoint becomes a no-op in steady state — it's still implemented for
+# parity with SQLite and for on-demand window shrinking.
+#
+# Domain = "ops" — the only table this service owns.
+
+resource "aws_dynamodb_table" "jobs" {
+  name         = "${var.table_prefix}jobs"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1PK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1SK"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "AllRecent-Index"
+    hash_key        = "GSI1PK"
+    range_key       = "GSI1SK"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(local.common_tags, { Domain = "ops" })
+}
+
+# ── lingo-ops Lambda (admin-only ops/finance API) ─────────────────────────────
+#
+# Deploys via Lambda Function URL (NOT API Gateway) per cost discipline —
+# Function URLs add zero per-request fees on top of Lambda invocation.
+# CORS is set here at the function-URL level; auth is handled by the
+# application via Auth0 JWT + ADMIN_USER_IDS allow-list.
+#
+# IAM least-privilege:
+#   - Basic execution role (CloudWatch Logs only — managed policy).
+#   - Inline policy granting Dynamo CRUD on lingo_jobs + its GSI ONLY.
+#   - Cost Explorer read APIs (pinned to us-east-1, the only region CE
+#     accepts).
+#   - NO Stripe/AdSense secrets — those arrive as env vars set out-of-band
+#     by the maintainer (see DEPLOY.md).
+#
+# Arch: ARM64 (Graviton2) — ~20% cheaper than x86 at identical perf for
+# Python workloads. The build script (lingo-ops/scripts/build-zip.sh)
+# already targets manylinux2014_aarch64.
+
+variable "lingo_ops_zip_path" {
+  description = "Path to the lingo-ops Lambda zip built by scripts/build-zip.sh — pass via -var or .tfvars (no default; absent path is a hard error so we don't silently apply a stale zip)."
+  type        = string
+}
+
+# Trust policy: only Lambda can assume this role.
+data "aws_iam_policy_document" "lingo_ops_lambda_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "lingo_ops_lambda" {
+  name               = "lingo-ops-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.lingo_ops_lambda_assume.json
+  tags               = merge(local.common_tags, { Domain = "ops" })
+}
+
+# CloudWatch Logs basic execution. The AWS-managed policy is fine here —
+# it scopes to log-group create/put for this function only.
+resource "aws_iam_role_policy_attachment" "lingo_ops_basic_exec" {
+  role       = aws_iam_role.lingo_ops_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Inline extras: jobs table CRUD + Cost Explorer read.
+data "aws_iam_policy_document" "lingo_ops_lambda_extras" {
+  # Jobs table — CRUD on the table itself.
+  statement {
+    sid = "JobsTableCRUD"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+      "dynamodb:BatchWriteItem",
+    ]
+    resources = [
+      aws_dynamodb_table.jobs.arn,
+      "${aws_dynamodb_table.jobs.arn}/index/*",
+    ]
+  }
+
+  # Cost Explorer — read-only metering APIs. CE is global but its API
+  # endpoint lives in us-east-1 only; pinning the resource ARN here is
+  # informational since CE doesn't support resource-level perms (all CE
+  # actions are "*" by spec), but keeping the condition makes the intent
+  # explicit in audits.
+  statement {
+    sid = "CostExplorerRead"
+    actions = [
+      "ce:GetCostAndUsage",
+      "ce:GetCostForecast",
+      "ce:GetDimensionValues",
+      "ce:GetTags",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "lingo_ops_lambda_extras" {
+  name        = "lingo-ops-lambda-extras"
+  description = "lingo_jobs CRUD + Cost Explorer read for the lingo-ops Lambda."
+  policy      = data.aws_iam_policy_document.lingo_ops_lambda_extras.json
+}
+
+resource "aws_iam_role_policy_attachment" "lingo_ops_extras" {
+  role       = aws_iam_role.lingo_ops_lambda.name
+  policy_arn = aws_iam_policy.lingo_ops_lambda_extras.arn
+}
+
+# The Lambda itself.
+resource "aws_lambda_function" "lingo_ops" {
+  function_name = "lingo-ops"
+  role          = aws_iam_role.lingo_ops_lambda.arn
+  handler       = "app.handler.handler"
+  runtime       = "python3.13"
+  architectures = ["arm64"]
+  memory_size   = 512
+  timeout       = 30
+
+  filename         = var.lingo_ops_zip_path
+  source_code_hash = filebase64sha256(var.lingo_ops_zip_path)
+
+  environment {
+    # Placeholder values — the maintainer fills the secret-bearing keys
+    # via the AWS console (see DEPLOY.md). The lifecycle block below
+    # tells Terraform to leave env vars alone on subsequent applies so
+    # the console-set values don't get clobbered.
+    # NOTE: AWS_REGION is reserved by Lambda — it's auto-set to the
+    # function's region and cannot be overridden via the environment
+    # block (terraform plan will reject it). Pydantic Settings picks it
+    # up from the runtime env automatically, so settings.AWS_REGION
+    # resolves correctly without us defining it here.
+    variables = {
+      DB_BACKEND                        = "dynamodb"
+      DYNAMODB_TABLE_PREFIX             = var.table_prefix
+      AUTH0_DOMAIN                      = ""
+      AUTH0_AUDIENCE                    = ""
+      ADMIN_USER_IDS                    = "[]"
+      OPS_JOB_TOKEN                     = "changeme"
+      CORS_ORIGINS                      = "[\"https://CHANGE-ME-prod-lingo-domain\"]"
+      STRIPE_API_KEY                    = ""
+      STRIPE_WEBHOOK_SECRET             = ""
+      GOOGLE_ADSENSE_ACCOUNT            = ""
+      GOOGLE_OAUTH_CLIENT_ID            = ""
+      GOOGLE_OAUTH_CLIENT_SECRET        = ""
+      GOOGLE_OAUTH_REFRESH_TOKEN        = ""
+      AWS_COST_READER_ACCESS_KEY_ID     = ""
+      AWS_COST_READER_SECRET_ACCESS_KEY = ""
+    }
+  }
+
+  lifecycle {
+    # Once the maintainer sets real secrets via console, never overwrite
+    # them on subsequent `terraform apply`. The variable block above is
+    # only used on initial creation.
+    ignore_changes = [environment[0].variables]
+  }
+
+  tags = merge(local.common_tags, { Domain = "ops" })
+}
+
+# Function URL — public HTTPS endpoint, NO API Gateway.
+resource "aws_lambda_function_url" "lingo_ops" {
+  function_name      = aws_lambda_function.lingo_ops.function_name
+  authorization_type = "NONE" # App handles auth via Auth0 JWT.
+
+  cors {
+    # Locked to the production lingo origin — update when the real
+    # domain is in place. Adding multiple origins is fine; wildcards
+    # would defeat the point of the CORS layer.
+    allow_origins  = ["https://CHANGE-ME-prod-lingo-domain"]
+    allow_methods  = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_headers  = ["authorization", "content-type", "x-dev-user"]
+    expose_headers = ["content-type"]
+    max_age        = 3600
+  }
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
@@ -458,4 +715,18 @@ output "social_leaderboard_table_name" {
 
 output "deck_votes_table_name" {
   value = aws_dynamodb_table.deck_votes.name
+}
+
+output "jobs_table_name" {
+  value = aws_dynamodb_table.jobs.name
+}
+
+output "lingo_ops_function_name" {
+  value = aws_lambda_function.lingo_ops.function_name
+}
+
+# Paste this URL into lingo's prod .env.production as VITE_OPS_API_BASE_URL.
+output "lingo_ops_url" {
+  description = "Public HTTPS endpoint for the lingo-ops Lambda. Wire into lingo as VITE_OPS_API_BASE_URL."
+  value       = aws_lambda_function_url.lingo_ops.function_url
 }
