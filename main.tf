@@ -661,7 +661,16 @@ resource "aws_lambda_function" "lingo_ops" {
     # Once the maintainer sets real secrets via console, never overwrite
     # them on subsequent `terraform apply`. The variable block above is
     # only used on initial creation.
-    ignore_changes = [environment[0].variables]
+    #
+    # source_code_hash + filename are ignored so the lingo-ops repo's own
+    # deploy workflow owns code updates via aws lambda update-function-code.
+    # Terraform manages infra (memory, timeout, env structure); CI manages
+    # the code. Clean separation, no double-deploy.
+    ignore_changes = [
+      environment[0].variables,
+      source_code_hash,
+      filename,
+    ]
   }
 
   tags = merge(local.common_tags, { Domain = "ops" })
