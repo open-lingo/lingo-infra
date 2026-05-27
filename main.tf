@@ -444,6 +444,81 @@ resource "aws_dynamodb_table" "deck_votes" {
   tags = merge(local.common_tags, { Domain = "decks" })
 }
 
+# ── Tags (admin-curated deck tag dictionary + deck ↔ tag join) ──────────────
+#
+# Backs lingo-core /api/core/v1/tags (public list) and the admin tag
+# routes under /api/core/v1/admin/tags. Mirrors the SQLite reference impl
+# in app/db/sqlite/tag.py (two tables: tags + deck_tags) flattened into a
+# single Dynamo table per the standard single-table pattern.
+#
+# Status: NOT YET IMPLEMENTED in app/db/dynamo/tag.py — the stub raises
+# NotImplementedError on every method. SQLite is the working backend
+# today. This table is provisioned ahead of the cut-over so the
+# implementer doesn't get blocked on infra. Tagged Domain = "decks"
+# because tags live under the decks UX surface (community browse facets,
+# deck create picker).
+#
+# Key layout:
+#   PK = SLUG#<slug>           SK = META                # canonical tag row
+#   PK = DECK#<deck_id>        SK = TAG#<slug>          # deck → tag mirror
+#   GSI1PK = TAG#<slug>        GSI1SK = DECK#<deck_id>  # reverse lookup
+#
+# Access patterns + decision log:
+#   1. list_tags()                  → Scan PK begins_with SLUG#, SK=META.
+#      Canonical tag dictionary is bounded (<200 rows in practice), so a
+#      Scan is cheaper than maintaining a GSI just to list. Add a GSI
+#      with a fixed partition (PK="ALL_TAGS") only if the dictionary ever
+#      grows past ~5k rows.
+#   2. get_tag(slug)                → GetItem (PK=SLUG#x, SK=META)
+#   3. create / update / delete_tag → PutItem / UpdateItem / DeleteItem
+#      under PK=SLUG#x. Cascade for delete: Query GSI1PK=TAG#x for all
+#      DECK#d rows, BatchWriteItem(delete).
+#   4. list_tags_for_deck(deck)     → Query PK=DECK#d, SK begins_with TAG#
+#   5. list_decks_for_tag(slug)     → Query GSI1PK=TAG#x  (the reverse GSI)
+#   6. set_deck_tags(deck, slugs)   → Query existing DECK#d/TAG#* rows,
+#      diff, BatchWriteItem(put new + delete missing). Replace semantics
+#      mirror the SQLite impl.
+#
+# GSIs: ONE.
+#   TagDeck-Index (GSI1PK / GSI1SK) — reverse lookup "which decks carry
+#   tag X". Used by list_decks_for_tag and for the cascade on tag delete.
+#   Cheap to maintain (deck_tags writes are admin/owner edits, not hot).
+#
+# TTL: NONE. Tags + mappings are persistent.
+
+resource "aws_dynamodb_table" "tags" {
+  name         = "${var.table_prefix}tags"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1PK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1SK"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "TagDeck-Index"
+    hash_key        = "GSI1PK"
+    range_key       = "GSI1SK"
+    projection_type = "ALL"
+  }
+
+  tags = merge(local.common_tags, { Domain = "decks" })
+}
+
 # ── Community (forum threads, posts, addons, markdown KV) ────────────────────
 #
 # Pre-provisioned for the future Dynamo cut-over. The app currently uses
