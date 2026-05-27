@@ -444,6 +444,240 @@ resource "aws_dynamodb_table" "deck_votes" {
   tags = merge(local.common_tags, { Domain = "decks" })
 }
 
+# ── Community (forum threads, posts, addons, markdown KV) ────────────────────
+#
+# Pre-provisioned for the future Dynamo cut-over. The app currently uses
+# SqliteCommunityRepository for `DB_BACKEND=sqlite` and falls back to the
+# in-memory MockCommunityRepository for `DB_BACKEND=dynamodb` until
+# app/db/dynamo/community.py is implemented — these tables exist so the
+# implementer doesn't get blocked on infra.
+#
+# We split into 5 tables instead of one because the access patterns and item
+# shapes diverge sharply (small vote rows vs. large markdown blobs vs. heavily
+# queried thread metadata). Mixing them in a single table would complicate
+# hot-key diagnostics and force a wider attribute schema than each domain
+# needs.
+#
+# Tag and category lookup live next to threads (small dimension tables, low
+# read traffic). The SQLite impl seeds the 5 default categories on first
+# connect; the Dynamo cut-over should do the same with a one-shot
+# PutItem-if-not-exists batch on first boot.
+
+# Threads — primary forum surface. Listing by category is the hot path.
+#
+#   PK = THREAD#<thread_id>          SK = META
+#   GSI1PK = "CATEGORY#<id>"         GSI1SK = "<updated_at>"  (newest-first list)
+#
+# Access patterns:
+#   1. create_thread / get_thread_by_id / update_thread / increment_views
+#       → PutItem / GetItem / UpdateItem on (PK, SK)
+#   2. list_threads(category_id, sort='new')
+#       → Query GSI1PK=CATEGORY#<id>, ScanIndexForward=false
+#   3. list_threads(category_id, sort='hot')
+#       → Query GSI1 then sort client-side; full re-rank in Lambda is fine
+#         at forum scale (low write rate, modest pages).
+#   4. list_threads(tag_id=...) / list_threads(content_type=...)
+#       → Read from the junction tables (lingo_community_thread_tags is the
+#         SQLite shape; in Dynamo the same data is stored as separate rows on
+#         the same thread item under SK = TAG#<tag_id> / CONTENT#<type>#<id>
+#         once the impl lands — no separate table needed).
+#
+# GSI choice: ONE GSI (CategoryUpdated-Index). Tag/content filters are rare
+#   enough to do a client-side filter on the category result set. If a query
+#   pattern needs sub-second tag filtering later, add a TagUpdated-Index then,
+#   not now.
+
+resource "aws_dynamodb_table" "community_threads" {
+  name         = "${var.table_prefix}community_threads"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1PK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1SK"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "CategoryUpdated-Index"
+    hash_key        = "GSI1PK"
+    range_key       = "GSI1SK"
+    projection_type = "ALL"
+  }
+
+  tags = merge(local.common_tags, { Domain = "community" })
+}
+
+# Posts (thread replies). Listed strictly by thread, oldest-first.
+#
+#   PK = THREAD#<thread_id>     SK = POST#<created_at>#<post_id>
+#
+# Access patterns:
+#   1. create_post                          → PutItem (also UpdateItem the
+#                                              parent thread reply_count + ts)
+#   2. list_posts_by_thread                 → Query PK=THREAD#id, SK begins_with POST#
+#   3. get_post_by_id / update_post         → Need an inverse lookup → use
+#       a "PostLookup" GSI keyed on POST#<post_id> when implementing, or
+#       require the thread_id in the route (we already do for create; for
+#       update we'd add a small GSI). Defer until the Dynamo impl lands.
+#
+# GSIs: NONE pre-provisioned. The route shape today (thread_id always in
+#   path) makes most reads cheap without a secondary index.
+
+resource "aws_dynamodb_table" "community_posts" {
+  name         = "${var.table_prefix}community_posts"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = merge(local.common_tags, { Domain = "community" })
+}
+
+# Votes (per-user upvotes/downvotes on threads + posts). Kept in its own
+# table so its small, high-write item shape doesn't muddy hot-key diagnostics
+# on the larger thread/post tables.
+#
+#   PK = TARGET#<target_type>#<target_id>     SK = USER#<user_id>
+#
+# Access patterns:
+#   1. upsert_vote(user, target_type, target_id, value) → PutItem (overwrites)
+#   2. remove_vote                                       → DeleteItem
+#   3. get_user_vote                                     → GetItem (PK, SK)
+#   4. Recompute counts for a target (after vote change)
+#       → Query PK=TARGET#..., COUNT/aggregate in Lambda then UpdateItem
+#         the denormalised count on the thread/post item.
+#
+# GSIs: NONE. No "what did user X vote on?" route exists.
+
+resource "aws_dynamodb_table" "community_votes" {
+  name         = "${var.table_prefix}community_votes"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = merge(local.common_tags, { Domain = "community" })
+}
+
+# Addons (community-contributed courses, flashcard packs, stories, grammar).
+# Listed by kind + language; filtered by author for "My Content".
+#
+#   PK = ADDON#<addon_id>            SK = META
+#   GSI1PK = "KIND#<kind>"           GSI1SK = "<updated_at>"  (browse by kind)
+#   GSI2PK = "AUTHOR#<author_id>"    GSI2SK = "<updated_at>"  (my content)
+#
+# Two GSIs because the two list paths are both first-class and neither
+# subsumes the other. Status filter (draft / published) is applied
+# client-side over the GSI page — status distribution is bimodal and the
+# extra partition would burn WCU for a cheap in-memory filter.
+
+resource "aws_dynamodb_table" "community_addons" {
+  name         = "${var.table_prefix}community_addons"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1PK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI1SK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI2PK"
+    type = "S"
+  }
+  attribute {
+    name = "GSI2SK"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "KindUpdated-Index"
+    hash_key        = "GSI1PK"
+    range_key       = "GSI1SK"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "AuthorUpdated-Index"
+    hash_key        = "GSI2PK"
+    range_key       = "GSI2SK"
+    projection_type = "ALL"
+  }
+
+  tags = merge(local.common_tags, { Domain = "community" })
+}
+
+# Markdown KV (rich content blobs — addon READMEs, flashcard pack JSON, etc.)
+# Pure key→content lookup; no list-by-prefix patterns today.
+#
+#   PK = MD#<key>      SK = META
+#
+# Access patterns:
+#   1. store_markdown / get_markdown / delete_markdown → PutItem / GetItem / DeleteItem
+#
+# GSIs: NONE. Keys are namespaced path-like strings (addons/abc123/readme)
+#   but there's no Scan-by-prefix route in the protocol. Add one only if a
+#   future "list all markdown under addons/<id>/" route appears.
+
+resource "aws_dynamodb_table" "community_markdown" {
+  name         = "${var.table_prefix}community_markdown"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = merge(local.common_tags, { Domain = "community" })
+}
+
 # ── Jobs (lingo-ops batch-job telemetry log) ──────────────────────────────────
 #
 # Append-only history of batch-job runs (nightly aggregation, TTS regen,
