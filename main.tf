@@ -927,6 +927,232 @@ resource "aws_lambda_function_url" "lingo_ops" {
   }
 }
 
+# ── lingo-events SQS queue (producers: lingo-core, lingo-ops; consumer: lingo-async) ─
+#
+# Standard (non-FIFO) queue. Order isn't required — handlers are commutative
+# (an xp_awarded event for user U applies the same delta regardless of whether
+# it arrives before or after the lesson_completed it came from).
+#
+# Visibility timeout = 60s: long enough for one cold-start (≤3s) plus N
+# Dynamo round-trips per message at worst-case batch-of-10 throughput. Lambda
+# itself caps at 30s per the function config; the extra 30s margin guards
+# against the rare slow-start case.
+#
+# Retention = 4 days: replays we'd want past that horizon are bug archaeology,
+# not normal operation — the producer record + CloudWatch trail get us there.
+#
+# Redrive: after 3 receives, the message moves to lingo-events-dlq for
+# inspection. maxReceiveCount = 3 follows AWS's standard recommendation
+# (one retry handles transient throttles; three protects against intermittent
+# downstream flakiness without burning excessive Dynamo write capacity).
+
+resource "aws_sqs_queue" "lingo_events_dlq" {
+  name                      = "lingo-events-dlq"
+  message_retention_seconds = 1209600 # 14 days — DLQ horizon
+
+  tags = merge(local.common_tags, { Domain = "async" })
+}
+
+resource "aws_sqs_queue" "lingo_events" {
+  name                       = "lingo-events"
+  visibility_timeout_seconds = 60
+  message_retention_seconds  = 345600 # 4 days
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.lingo_events_dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = merge(local.common_tags, { Domain = "async" })
+}
+
+# ── lingo-async Lambda (SQS-driven worker — quest eval, leaderboard updates) ──
+#
+# NO Function URL, NO API Gateway. Triggered by SQS event source mapping
+# (see aws_lambda_event_source_mapping.lingo_async below).
+#
+# IAM least-privilege:
+#   - Basic execution role (CloudWatch Logs only — managed policy).
+#   - Inline policy granting:
+#       * SQS receive/delete/getQueueAttributes on lingo-events ONLY (DLQ
+#         writes go through the redrive policy on the queue, not via the
+#         consumer's IAM).
+#       * Dynamo UpdateItem on lingo_social_leaderboard (real today).
+#       * Dynamo GetItem on lingo_users (read learning language + opt-in
+#         flag before writing to the leaderboard).
+#       * Dynamo Get/Update/Query on lingo_quests (future — the table
+#         doesn't exist yet, so the resource ARN below is intentionally
+#         a wildcard for the prefix; when the table lands, swap this for
+#         the concrete table ARN).
+#
+# Arch: ARM64 (Graviton2) — matches lingo-core / lingo-ops.
+
+variable "lingo_async_zip_path" {
+  description = "Path to the lingo-async Lambda zip built by scripts/build-zip.sh. Defaults to the sibling repo's dist output; override with -var or .tfvars if the layout differs."
+  type        = string
+  default     = "../lingo-async/dist/lingo-async.zip"
+}
+
+# Trust policy: only Lambda can assume this role.
+data "aws_iam_policy_document" "lingo_async_lambda_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "lingo_async_lambda" {
+  name               = "lingo-async-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.lingo_async_lambda_assume.json
+  tags               = merge(local.common_tags, { Domain = "async" })
+}
+
+resource "aws_iam_role_policy_attachment" "lingo_async_basic_exec" {
+  role       = aws_iam_role.lingo_async_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Inline extras: SQS consumer perms + Dynamo Get/Update on user / leaderboard /
+# quest tables. Quests table doesn't exist yet — the wildcard ARN spans the
+# whole prefix so adding the table later requires no IAM change.
+data "aws_iam_policy_document" "lingo_async_lambda_extras" {
+  statement {
+    sid = "SqsConsumer"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:ChangeMessageVisibility",
+    ]
+    resources = [aws_sqs_queue.lingo_events.arn]
+  }
+
+  statement {
+    sid = "LeaderboardUpdate"
+    actions = [
+      "dynamodb:UpdateItem",
+      "dynamodb:GetItem",
+    ]
+    resources = [aws_dynamodb_table.social_leaderboard.arn]
+  }
+
+  statement {
+    sid = "UserRead"
+    actions = [
+      "dynamodb:GetItem",
+    ]
+    resources = [aws_dynamodb_table.users.arn]
+  }
+
+  # Future quests table — not provisioned yet. Wildcard so when
+  # lingo_quests lands, no IAM change is required.
+  statement {
+    sid = "QuestsRW"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      "arn:aws:dynamodb:*:*:table/${var.table_prefix}quests",
+      "arn:aws:dynamodb:*:*:table/${var.table_prefix}quests/index/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "lingo_async_lambda_extras" {
+  name        = "lingo-async-lambda-extras"
+  description = "SQS receive/delete + Dynamo R/W for the lingo-async Lambda."
+  policy      = data.aws_iam_policy_document.lingo_async_lambda_extras.json
+}
+
+resource "aws_iam_role_policy_attachment" "lingo_async_extras" {
+  role       = aws_iam_role.lingo_async_lambda.name
+  policy_arn = aws_iam_policy.lingo_async_lambda_extras.arn
+}
+
+resource "aws_lambda_function" "lingo_async" {
+  function_name = "lingo-async"
+  role          = aws_iam_role.lingo_async_lambda.arn
+  handler       = "app.handler.lambda_handler"
+  runtime       = "python3.13"
+  architectures = ["arm64"]
+  memory_size   = 512
+  timeout       = 30
+
+  filename         = var.lingo_async_zip_path
+  source_code_hash = filebase64sha256(var.lingo_async_zip_path)
+
+  environment {
+    # No upstream-API credentials needed — the worker only talks to AWS
+    # services authenticated by the role above.
+    variables = {
+      DYNAMODB_TABLE_PREFIX = var.table_prefix
+      LOG_LEVEL             = "INFO"
+    }
+  }
+
+  lifecycle {
+    # The lingo-async repo's deploy workflow owns code updates via
+    # aws lambda update-function-code (same pattern as lingo-ops).
+    # Env vars are managed via this Terraform — there are no secret-
+    # bearing keys to console-protect.
+    ignore_changes = [
+      source_code_hash,
+      filename,
+    ]
+  }
+
+  tags = merge(local.common_tags, { Domain = "async" })
+}
+
+# Connect the queue to the function. Batch size 10 is the SQS standard
+# default — each invocation gets up to 10 messages. The partial-batch-
+# failure response type means we return a list of message ids to retry
+# (vs. fail-the-whole-batch). The lambda_handler code returns
+# {batchItemFailures: [...]} — see app/handler.py.
+resource "aws_lambda_event_source_mapping" "lingo_async" {
+  event_source_arn = aws_sqs_queue.lingo_events.arn
+  function_name    = aws_lambda_function.lingo_async.arn
+  batch_size       = 10
+
+  function_response_types = ["ReportBatchItemFailures"]
+}
+
+# ── Producer IAM: SendMessage on lingo-events ─────────────────────────────────
+#
+# lingo-ops gets the extra perm via its existing extras policy below. lingo-
+# core is NOT Terraform-managed in this repo as of 2026-05-27 — the
+# maintainer adds sqs:SendMessage on the lingo-events queue to whatever
+# IAM principal lingo-core runs under, by hand. See DEPLOY.md in
+# lingo-async for the exact policy JSON.
+
+# Extra perm for the lingo-ops Lambda — append send-message rights to a
+# dedicated policy so we don't have to edit the existing extras policy
+# JSON (cleaner diff).
+data "aws_iam_policy_document" "lingo_ops_events_publish" {
+  statement {
+    sid       = "PublishLingoEvents"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.lingo_events.arn]
+  }
+}
+
+resource "aws_iam_policy" "lingo_ops_events_publish" {
+  name        = "lingo-ops-events-publish"
+  description = "Allow lingo-ops Lambda to publish to the lingo-events SQS queue."
+  policy      = data.aws_iam_policy_document.lingo_ops_events_publish.json
+}
+
+resource "aws_iam_role_policy_attachment" "lingo_ops_events_publish" {
+  role       = aws_iam_role.lingo_ops_lambda.name
+  policy_arn = aws_iam_policy.lingo_ops_events_publish.arn
+}
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 
 output "users_table_name" {
@@ -973,6 +1199,26 @@ output "lingo_ops_function_name" {
 output "lingo_ops_url" {
   description = "Public HTTPS endpoint for the lingo-ops Lambda. Wire into lingo as VITE_OPS_API_BASE_URL."
   value       = aws_lambda_function_url.lingo_ops.function_url
+}
+
+# Producers need this as EVENTS_QUEUE_URL env var (lingo-core, lingo-ops).
+output "lingo_events_queue_url" {
+  description = "SQS queue URL for the lingo-events fan-out queue. Wire into producers as EVENTS_QUEUE_URL."
+  value       = aws_sqs_queue.lingo_events.url
+}
+
+output "lingo_events_queue_arn" {
+  description = "ARN of the lingo-events queue — handy for granting sqs:SendMessage to producers managed outside this Terraform (e.g. lingo-core)."
+  value       = aws_sqs_queue.lingo_events.arn
+}
+
+output "lingo_events_dlq_url" {
+  description = "Dead-letter queue URL — peek here when messages exceed maxReceiveCount."
+  value       = aws_sqs_queue.lingo_events_dlq.url
+}
+
+output "lingo_async_function_name" {
+  value = aws_lambda_function.lingo_async.function_name
 }
 
 # ── Deploy IAM user (CI / terraform apply from GitHub Actions) ────────────
