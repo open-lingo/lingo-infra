@@ -1006,6 +1006,20 @@ resource "aws_lambda_function_url" "lingo_ops" {
   }
 }
 
+# NOTE (Oct-2025 AWS change): NONE-auth function URLs need a SECOND resource-policy
+# statement — lambda:InvokeFunction with condition lambda:InvokedViaFunctionUrl=true —
+# in addition to the lambda:InvokeFunctionUrl one. Provider ~> 5.0 can't express that
+# condition (added in provider 6.x), so it's applied via CLI (statement id
+# "FunctionURLAllowPublicInvoke", currently present on lingo-ops and lingo-core).
+# See lingo_core_function.tf for the exact command. Without it the URL returns 403.
+resource "aws_lambda_permission" "lingo_ops_public_url" {
+  statement_id           = "FunctionURLAllowPublicAccess"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.lingo_ops.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
 # ── lingo-events SQS queue (producers: lingo-core, lingo-ops; consumer: lingo-async) ─
 #
 # Standard (non-FIFO) queue. Order isn't required — handlers are commutative
