@@ -159,6 +159,38 @@ resource "aws_lambda_function_url" "lingo_core" {
   authorization_type = "NONE" # App handles auth via Auth0 JWT.
 }
 
+# Public-access resource policy for the function URL. The console adds this
+# automatically when you create a NONE-auth URL; Terraform does NOT — without
+# it every request to the URL gets 403 Forbidden.
+#
+# Since October 2025, AWS requires BOTH lambda:InvokeFunctionUrl AND
+# lambda:InvokeFunction in the resource policy for NONE-auth URLs (older
+# URLs like lingo-ops's are grandfathered with just InvokeFunctionUrl).
+resource "aws_lambda_permission" "lingo_core_public_url" {
+  statement_id           = "FunctionURLAllowPublicAccess"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.lingo_core.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+# --- FunctionURLAllowPublicInvoke (managed OUTSIDE Terraform) -----------------
+# Since Oct 2025, NONE-auth function URLs ALSO need lambda:InvokeFunction in the
+# resource policy, scoped by the condition lambda:InvokedViaFunctionUrl=true so
+# it only applies to URL-originated calls (NOT direct API invocation).
+#
+# The AWS provider pinned here (~> 5.0) cannot express that condition
+# (`invoked_via_function_url` was added in provider 6.x), so this statement is
+# managed via CLI/boto3 instead of Terraform:
+#
+#   aws lambda add-permission --function-name lingo-core \
+#     --statement-id FunctionURLAllowPublicInvoke \
+#     --action lambda:InvokeFunction --principal '*' \
+#     --invoked-via-function-url
+#
+# TODO: fold this into Terraform when the provider is upgraded to >= 6.0.
+# If the function URL ever 403s after a function recreate, re-run the command.
+
 output "lingo_core_function_name" {
   value = aws_lambda_function.lingo_core.function_name
 }
