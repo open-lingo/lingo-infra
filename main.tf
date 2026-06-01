@@ -28,22 +28,27 @@ variable "environment" {
   default     = "dev"
 }
 
-provider "aws" {
-  region = var.aws_region
-}
-
-# Standard tag set applied to every table. The `Domain` tag is per-table
-# (merged in via `merge(local.common_tags, { Domain = "<domain>" })` on
-# each resource) so AWS Cost Explorer can break spend down by domain —
-# powers /api/ops/v1/finance/costs/by-domain in lingo-ops.
+# `Project` and `Environment` apply to every resource this provider
+# creates and are inherited via `default_tags`. Per-resource `tags =
+# { Domain = "<domain>" }` blocks merge on top so AWS Cost Explorer can
+# break spend down by domain — powers /api/ops/v1/finance/costs/by-domain
+# in lingo-ops.
+#
+# `Domain` is intentionally NOT defaulted: keeping it per-resource means
+# a forgotten override surfaces in code review rather than silently
+# bucketing into a fallback domain and skewing the cost rollup.
 #
 # Cost allocation tags become queryable only after a one-time activation
 # in the AWS Billing console (Cost allocation tags → Activate `Project`,
 # `Environment`, `Domain`), with ~24h propagation. See docs/cost-tags.md.
-locals {
-  common_tags = {
-    Project     = "open-lingo"
-    Environment = var.environment
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project     = "open-lingo"
+      Environment = var.environment
+    }
   }
 }
 
@@ -95,7 +100,7 @@ resource "aws_dynamodb_table" "users" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "users" })
+  tags = { Domain = "users" }
 }
 
 # ── Subscriptions (user content subscriptions: decks, addons, stories) ─────────
@@ -119,7 +124,7 @@ resource "aws_dynamodb_table" "subscriptions" {
   # and the only access pattern is user-scoped). Bucketing under "users"
   # keeps the Cost Explorer rollup matching the bill-mental-model rather
   # than the storage-layout-mental-model.
-  tags = merge(local.common_tags, { Domain = "users" })
+  tags = { Domain = "users" }
 }
 
 # ── SRS (per-user card state) ─────────────────────────────────────────────────
@@ -154,7 +159,7 @@ resource "aws_dynamodb_table" "srs" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "srs" })
+  tags = { Domain = "srs" }
 }
 
 # ── Decks ─────────────────────────────────────────────────────────────────────
@@ -204,7 +209,7 @@ resource "aws_dynamodb_table" "decks" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "decks" })
+  tags = { Domain = "decks" }
 }
 
 # ── Progress (per-attempt log + lesson/day/concept rollups) ───────────────────
@@ -249,7 +254,7 @@ resource "aws_dynamodb_table" "progress" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "progress" })
+  tags = { Domain = "progress" }
 }
 
 # ── Social (friends, requests, blocks, activity, invites, threads) ────────────
@@ -318,7 +323,7 @@ resource "aws_dynamodb_table" "social" {
     type = "S"
   }
 
-  tags = merge(local.common_tags, { Domain = "social" })
+  tags = { Domain = "social" }
 }
 
 # ── Social leaderboard (per-bucket XP ranking) ────────────────────────────────
@@ -380,7 +385,7 @@ resource "aws_dynamodb_table" "social_leaderboard" {
     enabled        = true
   }
 
-  tags = merge(local.common_tags, { Domain = "social" })
+  tags = { Domain = "social" }
 }
 
 # ── Deck votes (per-user upvotes on community decks) ──────────────────────────
@@ -441,7 +446,7 @@ resource "aws_dynamodb_table" "deck_votes" {
     type = "S"
   }
 
-  tags = merge(local.common_tags, { Domain = "decks" })
+  tags = { Domain = "decks" }
 }
 
 # ── Tags (admin-curated deck tag dictionary + deck ↔ tag join) ──────────────
@@ -516,7 +521,7 @@ resource "aws_dynamodb_table" "tags" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "decks" })
+  tags = { Domain = "decks" }
 }
 
 # ── Community (forum threads, posts, addons, markdown KV) ────────────────────
@@ -592,7 +597,7 @@ resource "aws_dynamodb_table" "community_threads" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "community" })
+  tags = { Domain = "community" }
 }
 
 # Posts (thread replies). Listed strictly by thread, oldest-first.
@@ -626,7 +631,7 @@ resource "aws_dynamodb_table" "community_posts" {
     type = "S"
   }
 
-  tags = merge(local.common_tags, { Domain = "community" })
+  tags = { Domain = "community" }
 }
 
 # Votes (per-user upvotes/downvotes on threads + posts). Kept in its own
@@ -660,7 +665,7 @@ resource "aws_dynamodb_table" "community_votes" {
     type = "S"
   }
 
-  tags = merge(local.common_tags, { Domain = "community" })
+  tags = { Domain = "community" }
 }
 
 # Addons (community-contributed courses, flashcard packs, stories, grammar).
@@ -720,7 +725,7 @@ resource "aws_dynamodb_table" "community_addons" {
     projection_type = "ALL"
   }
 
-  tags = merge(local.common_tags, { Domain = "community" })
+  tags = { Domain = "community" }
 }
 
 # Markdown KV (rich content blobs — addon READMEs, flashcard pack JSON, etc.)
@@ -750,7 +755,7 @@ resource "aws_dynamodb_table" "community_markdown" {
     type = "S"
   }
 
-  tags = merge(local.common_tags, { Domain = "community" })
+  tags = { Domain = "community" }
 }
 
 # ── Jobs (lingo-ops batch-job telemetry log) ──────────────────────────────────
@@ -824,7 +829,7 @@ resource "aws_dynamodb_table" "jobs" {
     enabled        = true
   }
 
-  tags = merge(local.common_tags, { Domain = "ops" })
+  tags = { Domain = "ops" }
 }
 
 # ── lingo-ops Lambda (admin-only ops/finance API) ─────────────────────────────
@@ -866,7 +871,7 @@ data "aws_iam_policy_document" "lingo_ops_lambda_assume" {
 resource "aws_iam_role" "lingo_ops_lambda" {
   name               = "lingo-ops-lambda-role"
   assume_role_policy = data.aws_iam_policy_document.lingo_ops_lambda_assume.json
-  tags               = merge(local.common_tags, { Domain = "ops" })
+  tags               = { Domain = "ops" }
 }
 
 # CloudWatch Logs basic execution. The AWS-managed policy is fine here —
@@ -917,6 +922,7 @@ resource "aws_iam_policy" "lingo_ops_lambda_extras" {
   name        = "lingo-ops-lambda-extras"
   description = "lingo_jobs CRUD + Cost Explorer read for the lingo-ops Lambda."
   policy      = data.aws_iam_policy_document.lingo_ops_lambda_extras.json
+  tags        = { Domain = "ops" }
 }
 
 resource "aws_iam_role_policy_attachment" "lingo_ops_extras" {
@@ -948,21 +954,19 @@ resource "aws_lambda_function" "lingo_ops" {
     # up from the runtime env automatically, so settings.AWS_REGION
     # resolves correctly without us defining it here.
     variables = {
-      DB_BACKEND                        = "dynamodb"
-      DYNAMODB_TABLE_PREFIX             = var.table_prefix
-      AUTH0_DOMAIN                      = ""
-      AUTH0_AUDIENCE                    = ""
-      ADMIN_USER_IDS                    = "[]"
-      OPS_JOB_TOKEN                     = "changeme"
-      CORS_ORIGINS                      = "[\"https://openlingoapp.com\", \"https://www.openlingoapp.com\"]"
-      STRIPE_API_KEY                    = ""
-      STRIPE_WEBHOOK_SECRET             = ""
-      GOOGLE_ADSENSE_ACCOUNT            = ""
-      GOOGLE_OAUTH_CLIENT_ID            = ""
-      GOOGLE_OAUTH_CLIENT_SECRET        = ""
-      GOOGLE_OAUTH_REFRESH_TOKEN        = ""
-      AWS_COST_READER_ACCESS_KEY_ID     = ""
-      AWS_COST_READER_SECRET_ACCESS_KEY = ""
+      DB_BACKEND                 = "dynamodb"
+      DYNAMODB_TABLE_PREFIX      = var.table_prefix
+      AUTH0_DOMAIN               = ""
+      AUTH0_AUDIENCE             = ""
+      ADMIN_USER_IDS             = "[]"
+      OPS_JOB_TOKEN              = "changeme"
+      CORS_ORIGINS               = "[\"https://openlingoapp.com\", \"https://www.openlingoapp.com\"]"
+      STRIPE_API_KEY             = ""
+      STRIPE_WEBHOOK_SECRET      = ""
+      GOOGLE_ADSENSE_ACCOUNT     = ""
+      GOOGLE_OAUTH_CLIENT_ID     = ""
+      GOOGLE_OAUTH_CLIENT_SECRET = ""
+      GOOGLE_OAUTH_REFRESH_TOKEN = ""
     }
   }
 
@@ -982,7 +986,7 @@ resource "aws_lambda_function" "lingo_ops" {
     ]
   }
 
-  tags = merge(local.common_tags, { Domain = "ops" })
+  tags = { Domain = "ops" }
 }
 
 # Function URL — public HTTPS endpoint, NO API Gateway.
@@ -1025,7 +1029,7 @@ resource "aws_sqs_queue" "lingo_events_dlq" {
   name                      = "lingo-events-dlq"
   message_retention_seconds = 1209600 # 14 days — DLQ horizon
 
-  tags = merge(local.common_tags, { Domain = "async" })
+  tags = { Domain = "async" }
 }
 
 resource "aws_sqs_queue" "lingo_events" {
@@ -1038,7 +1042,7 @@ resource "aws_sqs_queue" "lingo_events" {
     maxReceiveCount     = 3
   })
 
-  tags = merge(local.common_tags, { Domain = "async" })
+  tags = { Domain = "async" }
 }
 
 # ── lingo-async Lambda (SQS-driven worker — quest eval, leaderboard updates) ──
@@ -1082,7 +1086,7 @@ data "aws_iam_policy_document" "lingo_async_lambda_assume" {
 resource "aws_iam_role" "lingo_async_lambda" {
   name               = "lingo-async-lambda-role"
   assume_role_policy = data.aws_iam_policy_document.lingo_async_lambda_assume.json
-  tags               = merge(local.common_tags, { Domain = "async" })
+  tags               = { Domain = "async" }
 }
 
 resource "aws_iam_role_policy_attachment" "lingo_async_basic_exec" {
@@ -1143,6 +1147,7 @@ resource "aws_iam_policy" "lingo_async_lambda_extras" {
   name        = "lingo-async-lambda-extras"
   description = "SQS receive/delete + Dynamo R/W for the lingo-async Lambda."
   policy      = data.aws_iam_policy_document.lingo_async_lambda_extras.json
+  tags        = { Domain = "async" }
 }
 
 resource "aws_iam_role_policy_attachment" "lingo_async_extras" {
@@ -1182,7 +1187,7 @@ resource "aws_lambda_function" "lingo_async" {
     ]
   }
 
-  tags = merge(local.common_tags, { Domain = "async" })
+  tags = { Domain = "async" }
 }
 
 # Connect the queue to the function. Batch size 10 is the SQS standard
@@ -1221,6 +1226,7 @@ resource "aws_iam_policy" "lingo_ops_events_publish" {
   name        = "lingo-ops-events-publish"
   description = "Allow lingo-ops Lambda to publish to the lingo-events SQS queue."
   policy      = data.aws_iam_policy_document.lingo_ops_events_publish.json
+  tags        = { Domain = "ops" }
 }
 
 resource "aws_iam_role_policy_attachment" "lingo_ops_events_publish" {
@@ -1311,7 +1317,7 @@ output "lingo_async_function_name" {
 
 resource "aws_iam_user" "deploy" {
   name = "lingo-deploy"
-  tags = merge(local.common_tags, { Domain = "ops" })
+  tags = { Domain = "ops" }
 }
 
 resource "aws_iam_user_policy_attachment" "deploy_admin" {
@@ -1329,7 +1335,7 @@ resource "aws_iam_access_key" "deploy" {
 resource "aws_secretsmanager_secret" "deploy_credentials" {
   name        = "lingo/deploy-iam-credentials"
   description = "Access keys for the lingo-deploy IAM user. Paste into GitHub org secrets."
-  tags        = merge(local.common_tags, { Domain = "ops" })
+  tags        = { Domain = "ops" }
 }
 
 resource "aws_secretsmanager_secret_version" "deploy_credentials" {
