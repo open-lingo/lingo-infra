@@ -55,6 +55,10 @@ locals {
     aws_dynamodb_table.community_votes,
     aws_dynamodb_table.community_addons,
     aws_dynamodb_table.community_markdown,
+    aws_dynamodb_table.quests,
+    aws_dynamodb_table.admin_audit,
+    aws_dynamodb_table.platform_settings,
+    aws_dynamodb_table.stories,
   ]
 }
 
@@ -71,6 +75,7 @@ data "aws_iam_policy_document" "lingo_core_lambda_extras" {
       "dynamodb:Scan",
       "dynamodb:BatchGetItem",
       "dynamodb:BatchWriteItem",
+      "dynamodb:ConditionCheckItem",
     ]
     resources = concat(
       [for t in local.lingo_core_tables : t.arn],

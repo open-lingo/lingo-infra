@@ -758,6 +758,173 @@ resource "aws_dynamodb_table" "community_markdown" {
   tags = { Domain = "community" }
 }
 
+# ── Quests (per-user quest progress) ──────────────────────────────────────────
+#
+# Drives the quests/streak system surfaced on the social/learn pages. Every row
+# is owned by exactly one user, and the only query is "list my quests" — so a
+# single Query on PK is sufficient and no GSI is warranted yet.
+#
+# Key layout:
+#   PK = USER#<user_id>     SK = QUEST#<quest_id>
+
+resource "aws_dynamodb_table" "quests" {
+  name         = "${var.table_prefix}quests"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = { Domain = "quests" }
+}
+
+# ── Admin audit log (operator action history) ─────────────────────────────────
+#
+# Append-only log of admin actions taken via lingo-ops. Lexicographic SK
+# (<iso_at>#<id>) means a single descending Query gives chronological order.
+#
+# Key layout:
+#   PK = "AUDIT"            SK = "<iso_at>#<id>"
+#   attrs: actor_id (S), at (S), target_kind (S), …
+#
+# GSIs:
+#   ActorIndex      hash=actor_id     range=at   — filter by actor
+#   TargetKindIndex hash=target_kind  range=at   — filter by target type
+
+resource "aws_dynamodb_table" "admin_audit" {
+  name         = "${var.table_prefix}admin_audit"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "actor_id"
+    type = "S"
+  }
+  attribute {
+    name = "at"
+    type = "S"
+  }
+  attribute {
+    name = "target_kind"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "ActorIndex"
+    hash_key        = "actor_id"
+    range_key       = "at"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "TargetKindIndex"
+    hash_key        = "target_kind"
+    range_key       = "at"
+    projection_type = "ALL"
+  }
+
+  tags = { Domain = "ops" }
+}
+
+# ── Platform settings (admin-tunable key/value config) ────────────────────────
+#
+# Single-row-per-key table: PK is the setting name (e.g. "xp_economy"), SK is
+# a constant "META" so the table is essentially a typed key/value store. Reads
+# are GetItem; writes are PutItem. No GSIs.
+
+resource "aws_dynamodb_table" "platform_settings" {
+  name         = "${var.table_prefix}platform_settings"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = { Domain = "ops" }
+}
+
+# ── Stories (admin-authored narrative content) ────────────────────────────────
+#
+# One row per story (PK=STORY#<id>, SK="META").
+#
+# GSIs:
+#   LanguageStatusIndex hash=language_id range=status_updated_at
+#     status_updated_at = "<status>#<updated_at>" so the admin filter
+#     "?status=draft|published&language_id=ja" is a single Query with
+#     begins_with(status_updated_at, "draft#") (or "published#").
+#   AuthorIndex hash=author_id range=created_at — "stories I authored, newest first"
+
+resource "aws_dynamodb_table" "stories" {
+  name         = "${var.table_prefix}stories"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "language_id"
+    type = "S"
+  }
+  attribute {
+    name = "status_updated_at"
+    type = "S"
+  }
+  attribute {
+    name = "author_id"
+    type = "S"
+  }
+  attribute {
+    name = "created_at"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "LanguageStatusIndex"
+    hash_key        = "language_id"
+    range_key       = "status_updated_at"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "AuthorIndex"
+    hash_key        = "author_id"
+    range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  tags = { Domain = "content" }
+}
+
 # ── Jobs (lingo-ops batch-job telemetry log) ──────────────────────────────────
 #
 # Append-only history of batch-job runs (nightly aggregation, TTS regen,
