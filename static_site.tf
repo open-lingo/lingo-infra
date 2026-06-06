@@ -163,6 +163,12 @@ resource "aws_cloudfront_distribution" "site" {
     origin_access_control_id = aws_cloudfront_origin_access_control.site.id
   }
 
+  # Default behavior — covers index.html and any non-assets path. The
+  # deploy workflow sets `Cache-Control: no-cache` on index.html so
+  # CloudFront revalidates on each request; switching this to the
+  # managed CachingDisabled policy makes the contract explicit at the
+  # CDN edge and removes the implicit dependency on origin headers.
+  # Net effect: index.html invalidations land instantly.
   default_cache_behavior {
     target_origin_id       = "S3-site"
     viewer_protocol_policy = "redirect-to-https"
@@ -170,7 +176,26 @@ resource "aws_cloudfront_distribution" "site" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true
 
-    # AWS managed "CachingOptimized" policy
+    # AWS managed "CachingDisabled" policy — origin (S3) sets Cache-Control:
+    # no-cache on index.html so the SPA shell always picks up the latest
+    # hashed asset URLs immediately after a deploy.
+    cache_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+  }
+
+  # /assets/* — Vite emits content-hashed filenames so these are safely
+  # cached forever. Long TTL at the edge means returning users hit the
+  # CDN cache before the origin (much cheaper than 1-day default).
+  ordered_cache_behavior {
+    path_pattern           = "/assets/*"
+    target_origin_id       = "S3-site"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    # AWS managed "CachingOptimized" policy — 1y max TTL, default 1d.
+    # Combined with `immutable` in the S3 Cache-Control header (set by
+    # the deploy workflow), browsers never revalidate the hashed files.
     cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
   }
 
