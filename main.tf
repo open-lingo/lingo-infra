@@ -1161,16 +1161,11 @@ resource "aws_lambda_function_url" "lingo_ops" {
   function_name      = aws_lambda_function.lingo_ops.function_name
   authorization_type = "NONE" # App handles auth via Auth0 JWT.
 
-  cors {
-    # Locked to the production lingo origin — update when the real
-    # domain is in place. Adding multiple origins is fine; wildcards
-    # would defeat the point of the CORS layer.
-    allow_origins  = ["https://openlingoapp.com", "https://www.openlingoapp.com"]
-    allow_methods  = ["GET", "POST", "PUT", "DELETE"]
-    allow_headers  = ["authorization", "content-type", "x-dev-user"]
-    expose_headers = ["content-type"]
-    max_age        = 3600
-  }
+  # CORS handled by the FastAPI CORSMiddleware in `app/main.py` — keeping
+  # Function URL CORS configured ALSO causes duplicate
+  # `Access-Control-Allow-Origin` and `Vary: Origin` response headers
+  # (browsers reject the response per CORS spec). lingo-core's Function URL
+  # has no CORS block for the same reason. Single source of truth = the app.
 }
 
 # NOTE (Oct-2025 AWS change): NONE-auth function URLs need a SECOND resource-policy
