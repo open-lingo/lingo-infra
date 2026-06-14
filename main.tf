@@ -1248,6 +1248,18 @@ variable "lingo_async_zip_path" {
   default     = "../lingo-async/dist/lingo-async.zip"
 }
 
+# Shared service-to-service token for lingo-async -> lingo-core callbacks.
+# Sensitive, no default: supply via `TF_VAR_internal_service_token=...` at
+# apply time (or an uncommitted .tfvars). Must be byte-identical to the
+# INTERNAL_SERVICE_TOKEN set on the lingo-core Lambda (managed there via the
+# console, since core's env is ignore_changes-protected). Mismatch -> 401;
+# empty on core -> 500.
+variable "internal_service_token" {
+  description = "Shared bearer token for lingo-async -> lingo-core internal callbacks. Must match lingo-core's INTERNAL_SERVICE_TOKEN."
+  type        = string
+  sensitive   = true
+}
+
 # Trust policy: only Lambda can assume this role.
 data "aws_iam_policy_document" "lingo_async_lambda_assume" {
   statement {
@@ -1344,19 +1356,29 @@ resource "aws_lambda_function" "lingo_async" {
   source_code_hash = filebase64sha256(var.lingo_async_zip_path)
 
   environment {
-    # No upstream-API credentials needed — the worker only talks to AWS
-    # services authenticated by the role above.
     variables = {
       DYNAMODB_TABLE_PREFIX = var.table_prefix
       LOG_LEVEL             = "INFO"
+
+      # Service-to-service callbacks into lingo-core (quest progress, XP,
+      # leaderboard). Without these the worker defaults to localhost:8000
+      # with an empty token — every callback fails. LINGO_CORE_URL points
+      # at the core Lambda's Function URL (the client appends /api/core/v1
+      # and rstrips the trailing slash). INTERNAL_SERVICE_TOKEN must match
+      # the value set on lingo-core (console-managed there). Supply the
+      # token via TF_VAR_internal_service_token at apply time — never hard-
+      # code the secret in this file.
+      LINGO_CORE_URL         = aws_lambda_function_url.lingo_core.function_url
+      INTERNAL_SERVICE_TOKEN = var.internal_service_token
     }
   }
 
   lifecycle {
     # The lingo-async repo's deploy workflow owns code updates via
     # aws lambda update-function-code (same pattern as lingo-ops).
-    # Env vars are managed via this Terraform — there are no secret-
-    # bearing keys to console-protect.
+    # Env vars (incl. the secret above) are Terraform-managed: this
+    # resource has NO ignore_changes on environment, so a console edit
+    # would be reverted on the next apply. Change env here, not the console.
     ignore_changes = [
       source_code_hash,
       filename,
