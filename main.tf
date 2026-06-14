@@ -999,6 +999,31 @@ resource "aws_dynamodb_table" "jobs" {
   tags = { Domain = "ops" }
 }
 
+# Finance snapshot store for lingo-ops. Cached scalar snapshots keyed by
+# (source, key) — Stripe/AdSense/AWS/Auth0 mtd totals, last_synced_at, etc.
+# Sync jobs upsert; read endpoints serve only from here (never inline-call
+# the upstream billing APIs). Tiny volume (a few sources × a few keys), so
+# PAY_PER_REQUEST is effectively free. No GSI — every access pattern is a
+# (source, key) point-lookup or a source-partition Query.
+#   PK = "SOURCE#<source>"   SK = "KEY#<key>"
+resource "aws_dynamodb_table" "finance_snapshots" {
+  name         = "${var.table_prefix}finance_snapshots"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+
+  tags = { Domain = "ops" }
+}
+
 # ── lingo-ops Lambda (admin-only ops/finance API) ─────────────────────────────
 #
 # Deploys via Lambda Function URL (NOT API Gateway) per cost discipline —
@@ -1066,6 +1091,21 @@ data "aws_iam_policy_document" "lingo_ops_lambda_extras" {
       aws_dynamodb_table.jobs.arn,
       "${aws_dynamodb_table.jobs.arn}/index/*",
     ]
+  }
+
+  # Finance snapshot store — CRUD on the table itself. No GSI on this table.
+  statement {
+    sid = "FinanceSnapshotsCRUD"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+      "dynamodb:BatchWriteItem",
+    ]
+    resources = [aws_dynamodb_table.finance_snapshots.arn]
   }
 
   # Cost Explorer — read-only metering APIs. CE is global but its API
@@ -1221,6 +1261,55 @@ resource "aws_sqs_queue" "lingo_events" {
   tags = { Domain = "async" }
 }
 
+# ── Event log (lingo-async writes, lingo-ops inspector reads) ─────────────────
+#
+# Append-only log of every event the async worker processes, for
+# "investigate user behaviors and reconcile experience/purchases". Written
+# by lingo-async's DynamoEventsWriteRepository, read by lingo-ops's events
+# inspector. DISABLED BY DEFAULT — the async Lambda only writes here when
+# EVENT_LOG_BACKEND=dynamodb is set in its env (it is NOT today). Provisioned
+# so the cutover is a single env-var flip with no infra lag.
+#
+#   PK  = "USER#<user_id>"            partition per user (timeline reads)
+#   SK  = "EVENT#<received_at>#<id>"  received_at-ordered within the user
+#   GSI = "EventId-Index" (hash=id)   point-lookup for update_status/get_event
+#   TTL = ttl_epoch                   free sweep purges old rows
+#
+# PAY_PER_REQUEST: effectively free at current volume; no read/write
+# provisioning to tune.
+resource "aws_dynamodb_table" "events_log" {
+  name         = "${var.table_prefix}events_log"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "PK"
+  range_key    = "SK"
+
+  attribute {
+    name = "PK"
+    type = "S"
+  }
+  attribute {
+    name = "SK"
+    type = "S"
+  }
+  attribute {
+    name = "id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "EventId-Index"
+    hash_key        = "id"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl_epoch"
+    enabled        = true
+  }
+
+  tags = { Domain = "async" }
+}
+
 # ── lingo-async Lambda (SQS-driven worker — quest eval, leaderboard updates) ──
 #
 # NO Function URL, NO API Gateway. Triggered by SQS event source mapping
@@ -1312,6 +1401,25 @@ data "aws_iam_policy_document" "lingo_async_lambda_extras" {
       "dynamodb:GetItem",
     ]
     resources = [aws_dynamodb_table.users.arn]
+  }
+
+  # Event log — write-side (save + update_status). The GSI is read by
+  # update_status to resolve the base key from the messageId. Grant covers
+  # the table + its index even though writes only happen when
+  # EVENT_LOG_BACKEND=dynamodb is set (off by default) — provisioning the
+  # grant now keeps the cutover env-var-only.
+  statement {
+    sid = "EventLogWrite"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      aws_dynamodb_table.events_log.arn,
+      "${aws_dynamodb_table.events_log.arn}/index/*",
+    ]
   }
 
   # Future quests table — not provisioned yet. Wildcard so when
