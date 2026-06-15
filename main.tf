@@ -1266,9 +1266,9 @@ resource "aws_sqs_queue" "lingo_events" {
 # Append-only log of every event the async worker processes, for
 # "investigate user behaviors and reconcile experience/purchases". Written
 # by lingo-async's DynamoEventsWriteRepository, read by lingo-ops's events
-# inspector. DISABLED BY DEFAULT — the async Lambda only writes here when
-# EVENT_LOG_BACKEND=dynamodb is set in its env (it is NOT today). Provisioned
-# so the cutover is a single env-var flip with no infra lag.
+# inspector. ENABLED — the async Lambda's EVENT_LOG_BACKEND=dynamodb (set in
+# its environment block above) routes writes here. Writes are best-effort in
+# the handler, so a Dynamo failure never fails an event batch.
 #
 #   PK  = "USER#<user_id>"            partition per user (timeline reads)
 #   SK  = "EVENT#<received_at>#<id>"  received_at-ordered within the user
@@ -1467,6 +1467,11 @@ resource "aws_lambda_function" "lingo_async" {
     variables = {
       DYNAMODB_TABLE_PREFIX = var.table_prefix
       LOG_LEVEL             = "INFO"
+
+      # Append-only event audit log -> aws_dynamodb_table.events_log. Writes
+      # are best-effort in the handler (a Dynamo failure never fails the
+      # batch), and the IAM grant for the table is already attached below.
+      EVENT_LOG_BACKEND = "dynamodb"
 
       # Service-to-service callbacks into lingo-core (quest progress, XP,
       # leaderboard). Without these the worker defaults to localhost:8000
