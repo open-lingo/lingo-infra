@@ -100,6 +100,28 @@ data "aws_iam_policy_document" "lingo_core_lambda_extras" {
     actions   = ["sqs:ListQueues"]
     resources = ["*"]
   }
+
+  # Read the shared internal-service token from SSM at runtime (verifies the
+  # bearer presented by lingo-async on _internal callbacks). KMS Decrypt is
+  # required for the SecureString (default aws/ssm key), scoped via ViaService.
+  statement {
+    sid = "InternalServiceTokenRead"
+    actions = [
+      "ssm:GetParameter",
+    ]
+    resources = [aws_ssm_parameter.internal_service_token.arn]
+  }
+
+  statement {
+    sid       = "InternalServiceTokenDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = ["arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.aws_region}.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "lingo_core_lambda_extras" {
@@ -129,8 +151,11 @@ resource "aws_lambda_function" "lingo_core" {
   source_code_hash = filebase64sha256(var.lingo_core_zip_path)
 
   environment {
-    # Initial values; secrets (INTERNAL_SERVICE_TOKEN) get set via console.
-    # The lifecycle block below stops Terraform from clobbering them later.
+    # Initial values only; the lifecycle block below stops Terraform from
+    # clobbering console edits later. INTERNAL_SERVICE_TOKEN stays as an empty
+    # fallback — the real value lives in SSM (/lingo/internal-service-token)
+    # and is read at runtime (IAM grant above). The empty default just keeps
+    # the app booting before the SSM-reading code ships.
     variables = {
       DB_BACKEND             = "dynamodb"
       DYNAMODB_TABLE_PREFIX  = var.table_prefix
