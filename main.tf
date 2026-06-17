@@ -1370,15 +1370,30 @@ variable "lingo_async_zip_path" {
 }
 
 # Shared service-to-service token for lingo-async -> lingo-core callbacks.
-# Sensitive, no default: supply via `TF_VAR_internal_service_token=...` at
-# apply time (or an uncommitted .tfvars). Must be byte-identical to the
-# INTERNAL_SERVICE_TOKEN set on the lingo-core Lambda (managed there via the
-# console, since core's env is ignore_changes-protected). Mismatch -> 401;
-# empty on core -> 500.
-variable "internal_service_token" {
-  description = "Shared bearer token for lingo-async -> lingo-core internal callbacks. Must match lingo-core's INTERNAL_SERVICE_TOKEN."
-  type        = string
-  sensitive   = true
+# Source of truth is SSM Parameter Store (SecureString), NOT Terraform: both
+# lambdas read /lingo/internal-service-token at runtime (the env-var fallback
+# stays as a soft default until the SSM-reading code is deployed). Terraform
+# only provisions the parameter shell + IAM grants — it never carries the
+# secret value, which is why there's no longer a TF_VAR prompt at apply.
+#
+# One-time (and on rotation) set the real value out-of-band:
+#   aws ssm put-parameter --name /lingo/internal-service-token \
+#     --type SecureString --value "<token>" --overwrite --region us-west-1
+#
+# Standard tier (no per-param charge, no throughput surcharge); the default
+# aws/ssm KMS key handles encryption (free). ignore_changes on `value` keeps
+# Terraform from reverting the CLI-set secret back to the placeholder.
+resource "aws_ssm_parameter" "internal_service_token" {
+  name  = "/lingo/internal-service-token"
+  type  = "SecureString"
+  tier  = "Standard"
+  value = "PLACEHOLDER-set-via-cli"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = { Domain = "core" }
 }
 
 # Trust policy: only Lambda can assume this role.
@@ -1469,6 +1484,29 @@ data "aws_iam_policy_document" "lingo_async_lambda_extras" {
       "arn:aws:dynamodb:*:*:table/${var.table_prefix}quests/index/*",
     ]
   }
+
+  # Read the shared internal-service token from SSM at runtime. KMS Decrypt is
+  # required because the parameter is a SecureString encrypted under the
+  # account's default aws/ssm key (scoped via the ViaService condition so the
+  # grant only works through SSM, not arbitrary KMS use).
+  statement {
+    sid = "InternalServiceTokenRead"
+    actions = [
+      "ssm:GetParameter",
+    ]
+    resources = [aws_ssm_parameter.internal_service_token.arn]
+  }
+
+  statement {
+    sid       = "InternalServiceTokenDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = ["arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.aws_region}.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_policy" "lingo_async_lambda_extras" {
@@ -1506,15 +1544,13 @@ resource "aws_lambda_function" "lingo_async" {
       EVENT_LOG_BACKEND = "dynamodb"
 
       # Service-to-service callbacks into lingo-core (quest progress, XP,
-      # leaderboard). Without these the worker defaults to localhost:8000
-      # with an empty token — every callback fails. LINGO_CORE_URL points
-      # at the core Lambda's Function URL (the client appends /api/core/v1
-      # and rstrips the trailing slash). INTERNAL_SERVICE_TOKEN must match
-      # the value set on lingo-core (console-managed there). Supply the
-      # token via TF_VAR_internal_service_token at apply time — never hard-
-      # code the secret in this file.
-      LINGO_CORE_URL         = aws_lambda_function_url.lingo_core.function_url
-      INTERNAL_SERVICE_TOKEN = var.internal_service_token
+      # leaderboard). LINGO_CORE_URL points at the core Lambda's Function URL
+      # (the client appends /api/core/v1 and rstrips the trailing slash).
+      # INTERNAL_SERVICE_TOKEN is NOT set here: the worker reads it at runtime
+      # from SSM (/lingo/internal-service-token, IAM grant below). Until the
+      # SSM-reading code ships, the worker falls back to its empty-string
+      # default — which fails auth, so deploy that code before relying on it.
+      LINGO_CORE_URL = aws_lambda_function_url.lingo_core.function_url
     }
   }
 
