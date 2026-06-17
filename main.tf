@@ -348,15 +348,30 @@ resource "aws_dynamodb_table" "social" {
 #       → UpdateItem PK=BUCKET#x, SK=USER#me, ADD xp :inc, SET ttl=<epoch>
 #       (wired in app/progress/router.py; Dynamo impl pending)
 #   2. get my row for a bucket → GetItem (PK, SK)
-#   3. top-N for a bucket      → NOT YET WIRED. Current /social/leaderboards/*
-#      endpoints compute rankings on-the-fly from progress rollups; they
-#      don't read this table. When the read switches to query this table,
-#      add a GSI:
-#          GSI1PK = "PK" (i.e. BUCKET#x)   GSI1SK = "xp" (N)
-#      and Query ScanIndexForward=false for top-N. Skipping it now avoids
-#      paying WCU amplification on every leaderboard write for a read path
-#      no code exercises. **Add the GSI in the same commit that switches
-#      the read path** — not earlier.
+#   3. top-N for a bucket      → BucketXp-Index GSI (added 2026-06-17, cost
+#      item 5). Query GSI hash=PK (BUCKET#x), ScanIndexForward=false, Limit=N
+#      for a bounded top-N read instead of read-whole-bucket + sort-in-Lambda.
+#      This replaces the old on-the-fly recompute in /social/leaderboards/*
+#      (Scan lingo_users + per-user get_day_rollups). **The lingo-core read
+#      path that queries this GSI must NOT deploy until this GSI is applied —
+#      the Query 400s on a missing index.**
+#
+#      Projection = KEYS_ONLY. The GSI returns the table keys + the GSI sort
+#      key for every projected row, i.e.:
+#          PK  = BUCKET#<bucket>   (rank scope)
+#          SK  = USER#<user_id>    (who — parse the id off the SK)
+#          xp  = <Number>          (score, for rank ordering + display)
+#      That is the full set a top-N render needs to IDENTIFY + ORDER rows.
+#      Display fields (username, avatar, displayName) are NOT on the item —
+#      the async updater (lingo-async/app/leaderboard/updater.py) writes only
+#      {PK, SK, xp, ttl} — so there is nothing else to project today. The core
+#      read path hydrates display fields via BatchGetItem on lingo_users keyed
+#      by the user_ids parsed from each SK. KEYS_ONLY is deliberately leaner
+#      than INCLUDE/ALL: this is the hottest write path in the app (one
+#      UpdateItem per XP-earning lesson batch per opted-in user), and a wider
+#      projection would amplify WCU into the index on every write. If the
+#      write side is later extended to denormalize display fields onto the
+#      item, widen this to INCLUDE those specific attributes then — not before.
 #
 # TTL: enabled on attribute "ttl" (epoch seconds). Producer (Python) is
 #   expected to set ttl = bucket_end + 30 days grace so historical buckets
@@ -378,6 +393,23 @@ resource "aws_dynamodb_table" "social_leaderboard" {
   attribute {
     name = "SK"
     type = "S"
+  }
+  # GSI sort key — per-row XP total. Number so top-N ordering is numeric,
+  # not lexicographic.
+  attribute {
+    name = "xp"
+    type = "N"
+  }
+
+  # Top-N ranking index: reuse the table partition key (PK = BUCKET#<bucket>)
+  # as the GSI hash and rank within it by xp. Query ScanIndexForward=false +
+  # Limit=N for a bounded top-N read. See the access-pattern note above for the
+  # KEYS_ONLY projection rationale.
+  global_secondary_index {
+    name            = "BucketXp-Index"
+    hash_key        = "PK"
+    range_key       = "xp"
+    projection_type = "KEYS_ONLY"
   }
 
   ttl {
