@@ -44,7 +44,7 @@ locals {
 # --- Trust policies (one per repo, main branch only) --------------------------
 
 data "aws_iam_policy_document" "ci_trust" {
-  for_each = merge(local.ci_lambda_repos, { "lingo" = {} })
+  for_each = merge(local.ci_lambda_repos, { "lingo" = {}, "lingo-data" = {} })
 
   statement {
     effect  = "Allow"
@@ -151,12 +151,75 @@ resource "aws_iam_role_policy" "ci_web" {
   policy = data.aws_iam_policy_document.ci_web_permissions.json
 }
 
+# --- TTS asset publish role (lingo-data repo → tts/ prefix only) --------------
+#
+# Deliberately NOT reusing ci-lingo-web. That role can write anywhere in the
+# site bucket, including the app build; the audio publisher has no business
+# touching index.html. Scoping to the `tts/` prefix means a bug in the publish
+# job cannot take the site down.
+#
+# No s3:DeleteObject on purpose — publishing is append-only. Reclaiming
+# orphaned clips is a separate, deliberate sweep (the lingo-ops tts-sweep job),
+# which runs under its own identity.
+
+data "aws_iam_policy_document" "ci_tts_assets" {
+  statement {
+    sid       = "ListTtsPrefix"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.site.arn]
+
+    # ListObjectsV2 is prefix-scoped via this condition; without it the role
+    # could enumerate the whole site bucket.
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["tts/*"]
+    }
+  }
+
+  statement {
+    sid    = "PublishTtsObjects"
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+    ]
+    resources = ["${aws_s3_bucket.site.arn}/tts/*"]
+  }
+
+  statement {
+    sid       = "InvalidateTtsPaths"
+    effect    = "Allow"
+    actions   = ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"]
+    resources = [aws_cloudfront_distribution.site.arn]
+  }
+}
+
+resource "aws_iam_role" "ci_tts_assets" {
+  name                 = "ci-lingo-data"
+  description          = "GitHub Actions CI role for open-lingo/lingo-data (publishes TTS audio under tts/)"
+  assume_role_policy   = data.aws_iam_policy_document.ci_trust["lingo-data"].json
+  max_session_duration = 3600
+
+  tags = { Domain = "web" }
+}
+
+resource "aws_iam_role_policy" "ci_tts_assets" {
+  name   = "ci-lingo-data-permissions"
+  role   = aws_iam_role.ci_tts_assets.id
+  policy = data.aws_iam_policy_document.ci_tts_assets.json
+}
+
 # --- Outputs -------------------------------------------------------------------
 
 output "ci_role_arns" {
   description = "Per-repo CI role ARNs. Set each as role-to-assume in that repo's deploy workflow."
   value = merge(
     { for k, r in aws_iam_role.ci_lambda : k => r.arn },
-    { "lingo" = aws_iam_role.ci_web.arn },
+    {
+      "lingo"      = aws_iam_role.ci_web.arn,
+      "lingo-data" = aws_iam_role.ci_tts_assets.arn,
+    },
   )
 }

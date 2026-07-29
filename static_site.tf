@@ -199,6 +199,43 @@ resource "aws_cloudfront_distribution" "site" {
     cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
   }
 
+  # /tts/manifest/* — the per-language hash manifests. Small, and they change
+  # on every audio publish; a stale one points at clips that may not exist.
+  # MUST precede the /tts/* behavior below: ordered behaviors match in order,
+  # and /tts/* would otherwise swallow these and cache them for a year.
+  ordered_cache_behavior {
+    path_pattern           = "/tts/manifest/*"
+    target_origin_id       = "S3-site"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    # AWS managed "CachingDisabled" — revalidate every request.
+    cache_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+  }
+
+  # /tts/* — pre-generated speech clips published by the lingo-data pipeline.
+  # Filenames are content hashes under a version prefix (tts/v1/<lang>/<hash>
+  # .mp3), so bytes never change for a given key and these are safely
+  # immutable. A mass regeneration bumps the version prefix rather than
+  # overwriting.
+  ordered_cache_behavior {
+    path_pattern           = "/tts/*"
+    target_origin_id       = "S3-site"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+
+    # mp3 is already compressed — gzipping it at the edge burns CPU for ~0%
+    # savings and adds latency to every clip.
+    compress = false
+
+    # AWS managed "CachingOptimized" — 1y max TTL. Paired with the
+    # `immutable` Cache-Control the publish step sets on each object.
+    cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+  }
+
   # SPA routing: serve index.html for client-side routes.
   custom_error_response {
     error_code         = 403
