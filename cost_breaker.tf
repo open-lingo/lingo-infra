@@ -53,7 +53,7 @@ resource "aws_iam_role_policy" "cost_breaker_lambda" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid = "ThrottleFunctions"
+        Sid    = "ThrottleFunctions"
         Effect = "Allow"
         Action = [
           "lambda:GetFunctionConcurrency",
