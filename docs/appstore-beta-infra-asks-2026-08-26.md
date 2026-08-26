@@ -84,3 +84,30 @@ PowerUser can't create) subscribed to both topics. On trip: reserved
 concurrency → 0 on core+ops, app CloudFront distro disabled, prior state
 snapshotted to SSM, both of you paged with the one-line restore command.
 Until the apply, the alarms are email-only.
+
+## Trevor review checklist — every rate-limit / cost knob in one table
+
+Spencer's ask: you're the best at this — please sanity-check the thresholds.
+Everything below is LIVE unless marked otherwise. Numbers were sized off
+today's traffic (~1 warm instance); if any look wrong for where the app is
+headed, say so and we'll adjust.
+
+| Knob | Value | Where it lives |
+| --- | --- | --- |
+| lingo-core reserved concurrency | 20 | live + `lingo_core_function.tf` |
+| lingo-ops reserved concurrency | 5 | live + `main.tf` |
+| breaker Lambda concurrency | 1 | `cost_breaker.tf` (after apply) |
+| CloudFront rate rule (app distro) | 2,000 req/5min/IP | your `shared-cloudfront-waf` (console; distro not in tf) |
+| DynamoDB on-demand caps | 500 RRU / 200 WRU, all 21 `lingo_*` tables | your prior work (verified, untouched) |
+| Budget `lingo-monthly-guardrail` | $25/mo; email at $10, $25, forecast>$25 | AWS Budgets (CLI-created) |
+| Budget SNS backstop | 200% = $50 → `lingo-cost-alarms` us-east-1 | AWS Budgets (slow layer; billing lags ≤24 h) |
+| Alarm: core invocation flood | ≥6,000/min for 3 min | CloudWatch us-west-1 (CLI-created) |
+| Alarm: core throttle flood | ≥1,000/min for 3 min | CloudWatch us-west-1 (CLI-created) |
+| Alarm: app CDN request flood | ≥150,000 req/5min | CloudWatch us-east-1 (CLI-created) |
+| Alarm/backstop delivery | SNS `lingo-cost-alarms` both regions → email (subs pending confirmation) + breaker Lambda after apply | SNS (CLI) + `cost_breaker.tf` |
+| Unauthed API surface | `/health` only (`SURFACE_MODE=beta`) | lingo-core Lambda env (tf ignores env) |
+
+Review questions we'd most value your judgment on: (a) is 20/5 concurrency
+the right ceiling once real users arrive, (b) is the 2k/5min WAF rule tight
+enough given the CDN flood alarm fires at 150k/5min aggregate, (c) should the
+CLI-created alarms/budget/SNS be imported into tf so they're not drift.
