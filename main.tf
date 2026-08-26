@@ -1179,6 +1179,10 @@ resource "aws_lambda_function" "lingo_ops" {
   memory_size   = 512
   timeout       = 30
 
+  # Same abuse cap as lingo-core (see lingo_core_function.tf) — ops sees a
+  # fraction of core's traffic, so 5 is ample. Applied live 2026-08-26.
+  reserved_concurrent_executions = 5
+
   filename         = var.lingo_ops_zip_path
   source_code_hash = filebase64sha256(var.lingo_ops_zip_path)
 

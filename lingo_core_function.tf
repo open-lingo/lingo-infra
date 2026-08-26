@@ -147,6 +147,13 @@ resource "aws_lambda_function" "lingo_core" {
   memory_size   = 512
   timeout       = 30
 
+  # Hard cap on concurrent executions: bounds worst-case abuse of the public
+  # Function URL to ~$14/day of compute and firewalls the account's shared
+  # 1,000-concurrency pool (which lingo-async lives on). Sizing: real traffic
+  # is one warm instance; 20 is >10x headroom. Applied live 2026-08-26 —
+  # keep this attribute or the next apply strips the cap.
+  reserved_concurrent_executions = 20
+
   filename         = var.lingo_core_zip_path
   source_code_hash = filebase64sha256(var.lingo_core_zip_path)
 

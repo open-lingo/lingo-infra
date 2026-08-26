@@ -1,5 +1,18 @@
 # App Store beta — infra asks for Trevor (2026-08-26)
 
+> **STATUS (same day, evening): ALL FOUR DONE.** Spencer got SSO access
+> (PowerUser) and we applied them live: (1) reserved concurrency 20/5 set on
+> lingo-core/lingo-ops via CLI **and codified in tf** (this commit) so an
+> apply won't strip it; (2) `lingo-monthly-guardrail` budget created —
+> $25/mo, email alerts to Spencer + the account address at $10 actual,
+> $25 actual, and forecast>$25; (3) verified already in place (nice work):
+> the app distro has `shared-cloudfront-waf` attached with a 2,000 req/5min
+> rate rule + 3 managed rule sets, and every `lingo_*` table already carries
+> on-demand caps (500 RRU / 200 WRU); (4) `SURFACE_MODE=beta` set on
+> lingo-core — verified live: unauthed surface is now exactly `/health`;
+> boot/srs 401 correctly; community/tags/admin 404. The sections below are
+> kept as the rationale record.
+
 We're taking the iOS app public on the App Store (rebranded **Linguiversal**,
 bundle `com.linguiversal.app`). Before that happens, four infra changes shrink
 the abuse ceiling from ~$720/day to ~$14/day and cut the unauthenticated API
