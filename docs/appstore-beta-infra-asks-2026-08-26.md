@@ -66,3 +66,21 @@ Background reading (both pushed):
 
 Items 1–3 mirror §3 of the launch-readiness doc; item 4 is the pen-test's
 landed fix waiting on its env var. Questions → Spencer, or the two docs above.
+
+## Addendum (evening): cost circuit breaker
+
+Spencer asked for a true kill switch ("ok with breaking as long as we aren't
+charging Trevor"). Live already via CLI: SNS topic `lingo-cost-alarms` in
+us-west-1 + us-east-1 (email subs pending confirmation — Spencer +
+sortaminty, CHECK YOUR INBOXES), flood alarms
+(`lingo-core-invocation-flood` ≥6k invocations/min ×3, `lingo-core-throttle-flood`
+≥1k throttles/min ×3, `lingo-app-cdn-request-flood` ≥150k req/5min), and a
+budget 200% ($50) SNS notification as the slow backstop (billing data lags up
+to ~24 h — that's why the fast layer is usage metrics, not dollars).
+
+**Trevor: `terraform apply` wires the actual breaker** — `cost_breaker.tf` +
+`breaker/handler.py` add a `lingo-cost-breaker` Lambda (needs IAM, which
+PowerUser can't create) subscribed to both topics. On trip: reserved
+concurrency → 0 on core+ops, app CloudFront distro disabled, prior state
+snapshotted to SSM, both of you paged with the one-line restore command.
+Until the apply, the alarms are email-only.
